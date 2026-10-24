@@ -1,0 +1,467 @@
+================================================================================
+ 帧差法多目标物体检测 + HDMI 显示时序  工作交接
+ （本文件供【下一个对话】开局阅读，用于继承上一个对话的全部上下文）
+ 工程：lab_ex1_mipi_hdmi（安路 TD / PH1P35MDG324 / HX1P35A 开发板）
+ 器件：PH1P35MDG324   108 ERAM20K / 40 DSP / 21216 LUT6 / 42432 slice reg
+ 生成时间：2026-10-11
+================================================================================
+
+
+================================================================================
+第 0 节  新对话该怎么开局（最重要，先看这里）
+================================================================================
+在新对话里直接发这句话即可：
+
+    读 handover/帧差检测与HDMI时序_工作交接.txt，按里面的"当前状态"和
+    "待办"继续。上一个对话已经把 ① 帧差多目标检测 ② SW1 显示帧差二值图
+    ③ 显示时序违规修复与回退 都做完了，现在停在"等重新综合看 clk5 余量"。
+
+如果新对话需要动手改代码，务必先让它读本文件第 4 节（验证方法）和第 6 节
+（踩过的坑），那两节能避免重复犯同样的错误。
+
+
+================================================================================
+第 1 节  编译/仿真环境（绝对路径，直接可用）
+================================================================================
+【iverilog】
+  C:\Users\touch\.vscode\extensions\iccoderagenticverilogplatform.iccoder-2.0.9-win32-x64\tools\iverilog\win\bin\iverilog.exe
+  C:\Users\touch\.vscode\extensions\iccoderagenticverilogplatform.iccoder-2.0.9-win32-x64\tools\iverilog\win\bin\vvp.exe
+
+【python】
+  C:\Users\touch\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe
+
+【★ 必做：每次跑 iverilog 前先设 TMP】
+  New-Item -ItemType Directory -Force "sim\_tmp"
+  $env:TMP = (Resolve-Path "sim\_tmp").Path; $env:TEMP = $env:TMP
+  （不设会报 "Error opening temporary file ... Please check TMP or TMPDIR"）
+
+【★ PowerShell 引号陷阱（本会话踩了很多次）】
+  带中文/正则/转义的 python -c 内联命令在 pwsh 里几乎必然被解析坏。
+  ➜ 一律把 python 代码写成 .py 文件（放 %TEMP% 下）再执行。
+
+
+================================================================================
+第 2 节  本会话做了什么（时间顺序）
+================================================================================
+【A. 帧差法多目标检测】★ 核心成果
+  需求演进：
+    1) 最初是"上一帧 vs 这一帧"的帧差 -> 改成"背景帧 vs 这一帧"
+       - KEY4 按下 = 持续抓取背景（不报运动）
+       - KEY4 再按 = 冻结背景，开始检测
+    2) 原来用"列投影 + 行投影"只能出一个外接矩形，两个物体会被并成一个大框
+    3) 先试了【行游程匹配（连通域）】，能用但需要一张 240x135 的运动位图
+       （2 块 ERAM），而且邻域判定只用 x，垂直重叠的物体分不开
+    4) ★ 最终采用用户提出的【邻域投票法】：
+       - 每个运动块对 16 个目标槽各投一票
+       - 槽无效 或 该块落在槽的邻域之外 -> 投"新目标"票
+       - 全票 -> 新建目标；部分票 -> 扩展那些"没投票"的目标的 bbox
+       - ★ 邻域判定同时用 x 和 y，所以上下分开、左右重叠的物体也能分开
+       - 不需要运动位图，省掉 2 块 ERAM
+    5) 投票前加了【3x3 开运算（先腐蚀后膨胀）】去孤立噪点
+    6) 加了【输出框重叠合并】：本帧候选框与已输出框重叠就并入，不新开框
+    7) NT 16 -> 32（放第 4 个物体时目标表被占满 -> 全部不识别）
+    8) MAXO 4 -> 8（原来只是随手取的默认值，无硬件理由）
+
+【B. SW1 改用途：显示帧差二值图】
+  - SW1 原功能（Sobel 边缘图 + 红色边界）已悬空：isp_top 的
+    I_sobel_en 和 I_bnd_en 都固定接 1'b0
+  - SW1 拨上 = 显示帧差二值图（白 = 该 8x8 块在动，黑 = 静止）
+  - ★ 关键教训：一开始做成"与像素流同拍输出"，结果横条纹+频闪
+    原因：帧差模块跑在【ISP 输出】时序，mixer 跑在【HDMI 显示】时序，
+          两者差整整一帧，流被当成当前帧的图用 -> 错位
+    修法：帧差模块把运动位存成 240x135 位图（32 位打包，1080 字 ≈ 2 块 ERAM），
+          mixer 用 S_x_1d/S_y_1d 发地址查询，读出的字正好与 S_x_2d 对齐
+
+【C. HDMI 显示时序 —— 有改动也有回退，务必看清】
+  1) 实测：原来 H_FrameSize=2223 + 像素时钟 150 MHz = 59.979 Hz（近似 60）
+  2) 我改成 2222（60.006 Hz）-> ★ 屏幕无显示 ✗ -> 已回退到 2223
+     ★ 教训：显示时序参数不是"算出来更好就能改"，动了就可能黑屏
+  3) PLL 硬约束（user_source/ip_source/PLL/PLL.v）：
+        参考时钟 FIN = 50 MHz，VCO = 1500 MHz
+        CLKC0_DIV=15 -> 100.000 MHz 系统时钟
+        CLKC1_DIV=63 ->  23.81 MHz 摄像头
+        CLKC4_DIV=10 -> 150.000 MHz HDMI 像素
+        CLKC5_DIV=2  -> 750.000 MHz TMDS 串行（= 像素 x5）
+     ★ 148.5 MHz 分不出来：1500/148.5 = 10.101 非整数
+       而且 TMDS 要 742.5 = 148.5x5，所以 VCO 必须同时被两者整除
+       VCO = 1485j，而 1485/50 = 29.7 非整数 -> ★ 50 MHz 参考下无解
+       （穷举验证过 VCO <= 1600 MHz 内没有任何可行解）
+     ➜ 想严格 60.000000 Hz 只能靠 TD 的 PLL IP 开小数分频（PI_FRAC_EN），
+       那是 GUI 操作，需要用户生成 IP
+
+【D. 时序违规修复（与回退）】
+  时序报告位置：
+    td_project/camera_to_dsi_display_Runs/phy_1/final_timing.rpt
+    看开头的 "Clock Summary" 表，最后一列 SWNS(ns)：
+      正数 = 通过，负数 = 违规
+
+  历次实测数据（同一个报告文件，每次综合后重看）：
+  ┌────────────┬───────────┬──────────┬──────────┬──────────┐
+  │ 时钟域      │ 频率      │ 最初     │ 我改后   │ ★ 退回后  │
+  ├────────────┼───────────┼──────────┼──────────┼──────────┤
+  │ clk2       │ 150 MHz   │ -0.356   │ +0.099   │ -0.144   │
+  │ HDMI_PIXEL │           │          │          │          │
+  ├────────────┼───────────┼──────────┼──────────┼──────────┤
+  │ clk5       │ 750 MHz   │ -0.049   │ -0.221   │ +0.008   │
+  │ HDMI_SERIAL│           │          │          │ ★ 关键   │
+  ├────────────┼───────────┼──────────┼──────────┼──────────┤
+  │ clk0       │ 120 MHz   │ -1.968   │ -1.997   │ -1.629   │
+  │ MIPI_RX    │           │          │          │          │
+  └────────────┴───────────┴──────────┴──────────┴──────────┘
+  其余 clk1/3/4/6/7 始终为正。
+
+  我做的两次 mixer 流水线修改（已提交 b8e3edd / 2c1e0f6）：
+    · mbox_hit 改用 S_x_1d/S_y_1d 计算再寄存一拍
+    · OSD 链拆两段（坐标+字符选择用 1d 坐标寄存，ROM 在第二段）
+    效果：clk2 从 -0.144 -> +0.099 ✓ 但同一次综合 clk5 从 +0.008 -> -0.221
+    ★ clk5 是布局运气（同 RTL 上次是正的），不是逻辑问题
+  用户要求退回 -> 已执行并提交 adb85f9，hdmi_mixer.v 恢复到 001593c 的状态
+  （两个提交仍在历史里，需要时可以重新应用）
+
+
+================================================================================
+第 3 节  当前代码状态（截至最后一次提交 adb85f9）
+================================================================================
+【git】分支 main，工作区干净，共 37 次提交，无远程。
+
+【显示配置（已回退到用户原本能显示的值）】
+  design_top_wrapper.v 里 uivtc 例化：
+      .H_ActiveSize ( 1920 )
+      .H_FrameSize  ( 2223 )     ★ 不要动！2222 会黑屏
+      .H_SyncStart  ( 2008 )
+      .H_SyncEnd    ( 2052 )
+      .V_ActiveSize ( 1080 )
+      .V_FrameSize  ( 1125 )
+      .V_SyncStart  ( 1084 )
+      .V_SyncEnd    ( 1089 )
+  => 150 MHz / (2223 x 1125) = 59.979 Hz
+
+【帧差例化参数（design_top_wrapper.v）】
+  frame_diff_onchip #(
+      .IMG_W(1920), .IMG_H(1080),
+      .DIFF_THR(8'd90),        // 二值帧差阈值（用户指定）
+      .XCOMP(1), .YCOMP(2),    // 投票坐标补偿（实测标定，别乱改）
+      .MARGIN(4),              // 归为同一物体的邻域外扩块数
+      .MIN_HITS(2), .MIN_SIZE(3),   // 最少命中行数 / 最小尺寸（块）
+      .HOLD_FRM(8),            // 防闪烁保持帧数（约 0.13 秒）
+      .MAXO(8)                 // 输出框数上限
+  ) u_frame_diff (
+
+【模块内部默认值（frame_diff_onchip.v）】
+  NT = 32（目标槽数），OPEN_EN = 1（3x3 开运算），MIN_SIZE = 3，HOLD_FRM = 8
+
+【开关映射】
+  SW1 (A4)  = 显示帧差二值图（原 Sobel/红边界功能已悬空）
+  SW2 (B4)  = 已断开（I_dbg_sel 固定 0）
+  SW3 (E11) = 已断开
+  SW4 (D11) = 帧差使能 + 白色测试框（诊断用，建议后续去掉）
+  KEY1 = 曝光
+  KEY2 = 填充阈值（因 I_k4_en=0 已悬空）
+  KEY3 = 二值化阈值（只影响 Sobel 边缘链，★ 不影响帧差）
+  KEY4 (C7) = 抓取/冻结背景帧
+
+【显示颜色】
+  红 = 左右边界线 + 填充（ISP 侧，已随 SW1 悬空而关闭）
+  绿 = 14 张牌参考框（ISP 侧，同样已关闭）
+  白 = 固定测试框（mixer，SW4 打开就画）
+  青 = 运动目标框（mixer，最多 8 个）
+  黄 = OSD 四行（H/D/F/M）
+
+【OSD 四行含义】
+  H = 目标表已用槽数（O_obj_cnt）★ 上板诊断表是否被占满
+  D = 左右边界距离
+  F = 帧差收到的帧数
+  M = 本帧开运算后的运动块数
+
+【文件关系（★ 极其重要）】
+  · TD 实际编译的是 design_top_wrapper.v 和 isp/isp_top.v
+  · frame_diff_onchip.v 是被【内联】进 design_top_wrapper.v 的
+    （本项目约定：绝不往 td_project/*.al 加新文件，TD 会覆盖它）
+  · sobel_edge_128.v 是被【内联】进 isp/isp_top.v 的
+  ➜ ★ 改完 frame_diff_onchip.v 必须重新内联到 design_top_wrapper.v
+     （替换"以下为内联的 frame_diff_onchip.v"横幅到该模块 endmodule 之间）
+  ➜ ★ 改完 sobel_edge_128.v 要跑 sim/inline_sobel.py
+
+
+================================================================================
+第 4 节  验证方法（改完任何东西都要跑，★ 这次会话靠它抓到了很多 bug）
+================================================================================
+【完整回归 5~6 组】
+  1) python sim/check_static.py                -> 156 项静态检查
+  2) python sim/check_i2c_seq.py               -> 21 项 I2C 时序
+  3) 边界自检：
+     iverilog -g2012 -o m.vvp sim/tb_multi.v user_source/hdl_source/isp/sobel_edge_128.v sim/prim_ph1p_eram_sim.v
+     vvp m.vvp | findstr "MULTI ALL CHECKS PASSED"
+  4) 帧差自检：
+     iverilog -g2012 -o fd.vvp sim/tb_fdiff.v user_source/hdl_source/frame_diff_onchip.v
+     vvp fd.vvp | findstr "FDIF ALL CHECKS PASSED"
+     （TB 里造了 2 个 4x4 块的物体 + 1 个孤立噪点块，
+       断言：只有 A 时 1 个框；A+B+噪点 时 2 个框（噪点被开运算删掉）；
+             回背景后 0 个框；★ 任意两个有效框不得重叠）
+  5) mixer 编译：
+     iverilog -g2012 -o hm.vvp user_source/hdl_source/hdmi_mixer.v
+  6) python sim/check_gamma.py
+
+【单文件语法检查（★ 强烈建议，防止"逗号被注释吃掉"这类事故）】
+  iverilog -g2012 -t null -o nul user_source/hdl_source/design_top_wrapper.v
+  ★ 只剩 "Unknown module type" 是正常的（其它模块不在单文件里）
+  ★ 出现 "syntax error" 就必须修 —— TD 会把它报成
+    "Incorrect top-level module name"，非常误导
+
+【TD 时序报告的读法】
+  文件：td_project/camera_to_dsi_display_Runs/phy_1/final_timing.rpt
+  看开头 Clock Summary 表的 SWNS(ns) 列：
+      clk2 = HDMI_PIXEL_CLK  150 MHz
+      clk5 = HDMI_SERIAL_CLK 750 MHz   ★ 决定显示器能否锁住
+      clk0 = MIPI_RX_BYTE_CLK 120 MHz  （影响画质，不影响掉同步）
+
+
+================================================================================
+第 5 节  待办 / 未解决问题
+================================================================================
+【★ 最优先：clk5 余量】
+  上一版（退回后的源码）实测 clk5 = +0.008 ns ✓
+  但同一份 RTL 重跑综合可能又变负（布局波动，只有 35 个端点）
+  做法：
+    1) 重新综合 -> 看 clk5
+    2) 若为负 -> TD 里提高布局布线优化等级
+       （Optimization Effort -> High/Highest，打开 Multi-pass / Physical Synthesis）
+    3) 仍为负 -> 重跑几次挑最好的一次（换 seed）
+  ★ clk5 违规 = 显示器右上角弹 "HDMI" 重新握手 = 偶尔断联（用户实测现象）
+  ★ 不能从 RTL 修：lane_lvds_10_1.v 里给 I_data_in 加寄存会推迟 TMDS 加载时刻
+     1 个串行时钟，load_en 每 5 个串行时钟才有效一次 -> 位序全错 -> 画面废
+
+【clk0 = -1.629 ns（105 条违规）】
+  在 MIPI 接收 + ISP 前端域。只影响画质（偶发噪点），不影响 HDMI 锁屏。
+  修它要动 ISP 流水线结构，工作量大风险高。建议靠提高 P&R 优化等级压。
+
+【白色测试框】
+  mixer 里 TBOX_X1=100/TBOX_X2=399/TBOX_Y1=100/TBOX_Y2=199，
+  由 I_tbox_en（=SW4）控制。多目标功能已验证可用，建议去掉。
+
+【clk2 的 -0.144 ns】
+  我修的两次（b8e3edd / 2c1e0f6）能把它变正，但会让 clk5 变差（布局效应）。
+  如果重新综合后 clk2 仍然负且 clk5 为正，可以考虑只重新应用 b8e3edd（mbox_hit 流水线）。
+
+【跨帧跟踪（可选增强）】
+  现在目标表每帧清空、按扫描顺序分配槽位。若某帧漏检一个物体，
+  后面物体的槽位会整体前移 -> 框跳到别的物体位置 -> 看起来像闪烁。
+  HOLD_FRM 治不了这个（它只能"保持"，认不出是不是同一个物体）。
+  根治办法：让本帧目标去匹配上一帧的框（中心距离 / 重叠面积），沿用槽位。
+
+
+================================================================================
+第 6 节  踩过的坑（★ 新对话务必先看，避免重复）
+================================================================================
+【1】位宽截断 —— 本会话最坑的一类
+  · s_fo 只有 2 位 -> 第 4 个框时 3+1 回绕成 0
+    -> O_obj_cnt 显示 0，且 FO_DONE 里 "qi >= s_fo" 把所有框都清掉 -> 频闪
+  · s_hold 只有 2 位 -> HOLD_FRM=8 被 [1:0] 截断成 0 -> 防闪烁完全没生效
+    （我白让用户上板验证了两轮才发现）
+  · s_scan/s_sel 在 NT 从 16 改 32 后仍是 5 位 -> 扫描不终止 -> 重复出框
+  ➜ ★ 改任何参数后，立刻核对承载它的寄存器位宽是否够
+
+【2】always 块内被写的 reg，用组合逻辑读会拿到【旧值】
+  · 重叠合并判定原本用 O_bv[gk]，但 O_bv 在同一 always 块里被写
+    -> 读到上一帧的框 -> 本帧第一个候选就"重叠" -> 全被吞掉
+  · 修法：用独立的 s_emit 掩码（进入扫描时清零）
+  · 同类问题在本项目已出现 3 次
+
+【3】无符号数做减法得到负数 -> 比较恒真
+  · 邻域判定写成 (bx < t_x1[vi] - MARGIN)
+    t_x1 是 reg[9:0]，MARGIN 是 integer(32 位有符号)
+    0-2 = -2 -> 按 32 位无符号解释 = 4294967294 -> 判定恒真
+    -> 所有目标都投"新目标"票 -> 每个块都新建目标
+  · 修法：写成全加法形式 (bx + MARGIN >= x1) && (bx <= x2 + MARGIN)
+
+【4】变量索引的非阻塞赋值
+  实测 iverilog 下 t_val[t_cnt] <= 1'b1 没写进去（也可能是别的原因）
+  改成显式 for 循环按 t_cnt 命中写入后正常。
+
+【5】生成 we/wa/wd 三个写信号，却忘了写数组本身
+  · 运动位图只生成了 s_map_we/s_map_wa/s_map_wd，漏了
+    "if (s_map_we) s_map[s_map_wa] <= s_map_wd;"
+  -> 读出来全是 X，扫描永远找不到目标
+  ➜ 加监视打印出来的字，一眼就能看到 xxxxxxxx
+
+【6】正则改注释时把行尾逗号吃进注释（出现两次）
+  · ".DIFF_THR(8'd72) // 36 -> 72," 逗号进了注释
+  -> 参数表语法错 -> TD 报 "Incorrect top-level module name"
+  ➜ 改完参数表一律跑单文件语法检查
+
+【7】跨模块传"流"必须先确认两端时序基准一致
+  · 帧差流基准 = ISP 输出时刻；mixer 显示基准 = HDMI 显示时刻（晚一帧）
+  -> 必须传"存下来的数据 + 坐标查询"，不能传流
+
+【8】显示时序参数（H_FrameSize 等）不是"算出来更好就能改"
+  · 我把 2223 改成 2222（帧率更接近 60）-> 屏幕直接黑
+  ➜ 这类改动必须先在硬件上验证，不能凭算术推断
+
+【9】PowerShell + 内联 python 的引号问题
+  带中文/正则/转义的 python -c 在 pwsh 里基本都会被解析坏
+  ➜ 一律写成 .py 文件再执行
+
+【10】TD 报 "Incorrect top-level module name"
+  真实含义几乎总是"文件解析失败"，不是模块名真的不对
+  ➜ 用 iverilog -t null 单文件解析定位
+
+
+================================================================================
+第 7 节  关键代码位置速查
+================================================================================
+  design_top_wrapper.v
+      · 顶层，TD 实际编译的文件
+      · uivtc 例化（显示时序）≈ 行 780 附近
+      · frame_diff_onchip 例化 ≈ 行 825 附近
+      · frame_diff_onchip 内联副本 ≈ 行 1099 起
+      · SW/KEY 映射、S_fdimg_en、S_fdv_bv/bx1..by2 声明 ≈ 行 580~615
+
+  frame_diff_onchip.v
+      · ① 行/拍计数  ② 8x8 块平均  ③ 背景帧
+      · ④ 运动判定  ④b 开运算（3 行位图 + 腐蚀/膨胀）  ④c 运动位图 RAM（调试）
+      · ⑤ 目标表 + 邻域投票（s_vote / s_allvote）
+      · ⑥ 帧末输出扫描（FO_IDLE/FO_SCAN/FO_DONE，含重叠合并 s_emit、防闪烁 s_hold）
+      · ⑦ 诊断（O_frame_cnt / O_mot_cnt）
+
+  hdmi_mixer.v
+      · 坐标延迟链 S_x_1d/S_x_2d/S_y_1d/S_y_2d（★ 所有对齐都靠它）
+      · OSD（osd_area/osd_lx/osd_ly -> osd_ch -> osd_char_lib -> osd_hit）
+      · box_hit 函数 + mbox_hit（8 个框）
+      · 帧差二值图查询（q_bx/q_by/O_fd_q_addr/q_bit）
+      · 输出优先级：logo > 二值图 > 白测试框 > 青框 > 黄 OSD > 视频
+
+  lane_lvds_10_1.v
+      · HDMI 10:1 串行器（oddr + 5 位移位），clk5 违规就在这里
+      · ★ 不要动它的加载相位
+
+  user_source/ip_source/PLL/PLL.v
+      · PLL 参数（VCO 1500 MHz，各 CLKCx_DIV）
+      · ★ 改这里等于改整个时钟树，风险极高
+
+  sim/
+      · tb_fdiff.v        帧差自检（双物体 + 噪点 + 重叠断言）
+      · tb_multi.v        边界自检
+      · tb_thr.v          填充阈值
+      · tb_sobel_pipeline.v / tb_isp_chain.v   端到端
+      · check_static.py / check_i2c_seq.py / check_gamma.py
+      · inline_sobel.py   把 sobel_edge_128.v 内联进 isp_top.v
+
+
+================================================================================
+第 8 节  用户的工作习惯（新对话请遵守）
+================================================================================
+  · 回答要直接、简短，不要绕。用户会拿结论直接上板验证。
+  · 用户报现象很具体（"放第四个就都不识别" / "H 变 0" / "偶尔断联"），
+    这些都是极有价值的线索，要当第一手证据用。
+  · ★ 不要擅自改显示时序/时钟相关的参数。改之前先问。
+  · ★ 不要擅自改二值帧差阈值 DIFF_THR —— 那是用户指定的值。
+    要"降投票门槛"就改 MARGIN，不是改 DIFF_THR（本会话犯过这个错）。
+  · 改完必须跑回归；改完参数表必须跑单文件语法检查。
+  · 每次改动都要 git 提交，提交信息用英文 ASCII（中文会被 git 解析坏），
+    并且不要用 "->" 这种会被当成 pathspec 的字符。
+
+================================================================================
+第 9 节  【2026-10-12 追加】clk5 时序收敛 —— 已解决，零 RTL 改动
+================================================================================
+【一句话】HDMI 链路的时序违规全部清零，第 5 节那个"最优先：clk5 余量"已完成。
+
+【根因】lane_lvds_10_1.v 的 4 个实例（hdmi_phy_warpper.v 里 u0..u3）内部的
+  S_odd_even / S_load_en 三条链是纯自由计数器、与数据无关，4 份完全相同。
+  TD 综合时按"等价逻辑合并"把它们并成了 1 个寄存器，于是那条
+  S_load_en_2d 网要驱动 4 个 lane × 10 个移位寄存器：
+      综合后扇出 = 40（每 lane 各一份时应为 10）
+      布线后该 net 延迟 0.552ns，占 clk5 最差路径的 50% → clk5 = -0.049ns
+  ★ 物理阶段修不了它。试过 phys_opt -force_replication_on_nets 定向复制：
+    扇出 19→15，但 net 延迟一个皮秒都没变（瓶颈是驱动器离负载太远，不是负载
+    数量）。这条路可以不用再试。
+
+【修法】两条参数，RTL 一行没改：
+  1) 综合 syn_1 ： set_param rtl merge_equal off
+     官方说明（td.exe 内）："Merge equivalent logic. on: merge equivalent
+     logic and save area resources. off: preserve equivalent logic."
+     效果：那条网扇出 40 → 10；综合级 clk5 从 -0.473 改善到 -0.262。
+     代价：资源几乎不变（u_uicfgcs520 181→173 LUT，video_out 192→191）。
+  2) 布局布线 phy_1 ：TimingUltra 全部 14 条参数
+     效果：clk2 仅靠这一项就自己转正（-0.356 → +0.059）。
+
+【三轮实测（同一套 RTL，报告文件见下）】
+  ┌──────────────┬───────────────┬───────────────┬───────────────┐
+  │ 时钟域        │ 默认档(原始)   │ 仅 TimingUltra │ +merge_equal  │
+  ├──────────────┼───────────────┼───────────────┼───────────────┤
+  │ clk5 750MHz  │ -0.049 (2违规) │ -0.004 (4违规) │ +0.023 (0) ✓  │
+  │ clk2 150MHz  │ -0.356 (24)    │ +0.059 (0) ✓   │ +0.414 (0) ✓  │
+  │ clk0 120MHz  │ -1.968 (105)   │ -1.124 (56)    │ -0.990 (71)   │
+  └──────────────┴───────────────┴───────────────┴───────────────┘
+  clk0 只影响画质噪点，不影响 HDMI 锁屏，按用户意见不再追。
+  报告：td_project/camera_to_dsi_display_Runs/phy_tu3_cli/camera_to_dsi_display_pr.timing
+
+【板子上现在烧的 bit】
+  td_project/camera_to_dsi_display_Runs/phy_1/camera_to_dsi_display.bit
+  （与 best_result/ 下同名文件同一份，MD5 D3D180D263F7828D779B6EED9E3024FC）
+  原版已备份：.../camera_to_dsi_display_Runs/OLD_default_strategy_20261012.bit
+  （MD5 FEC64A9221F68F198E973B101F8CA97F；要回退就把它拷回 phy_1/ 同名文件）
+
+【已解决：参数已由 TD 自己写进 .al】2026-10-14 更新
+  用户在 TD 的 "More Options" 里填好了参数，TD 把它们写进
+  td_project/camera_to_dsi_display.al：
+      syn_1: <RtlProperty><merge_equal>off</merge_equal></RtlProperty>
+      phy_1: <PlaceProperty> effort/opt_timing/hfn_opt_effort/logic_level_opt/
+             post_place_opt + <RouteProperty> post_route_opt
+      两个 Run 的 <UserParams> 里也各有一份 <param> 文本
+  ➜ **在 TD 里点 Run 会带上这些参数，不会再退回默认档。** 第 9 节的改善是持久的。
+  ➜ 要改参数继续走 More Options（或下面的参数文件），**绝不要手写 .al** ——
+     TD 会把文本解析成带类型的 XML 节点，手写猜不出这个结构、写坏会导致打不开工程。
+  （以下是当时找入口的说明，留着备查）：
+    在运行的属性窗口里找 "More Options" 输入框（td.exe 里它的说明是
+    "Set other parameters for %1. 1) Format: set_param step param value,
+    set_param 可省略; 2) 合法步骤 syn 是 flow/design/rtl/gate/timing，
+    phy 是 flow/place/route/bitgen/timing; 3) 一行一个参数"），
+    syn_1 贴：   rtl merge_equal off
+    phy_1 贴：   place effort high / place opt_timing ultra / place logic_level_opt on
+                 place aggressive_opt 21 / place enable_extra_timing on
+                 place opt_long_path_over_slack 600 / place shifter_opt on
+                 place shifter_opt_preplace on / place crit_path_opt on
+                 place post_place_opt high / place hfn_opt_effort high
+                 route post_route_opt high / route postrt_opt_loc 20
+                 route postrt_opt_extra_round 4
+  等价文件（已提交仓库，可被 Import Param... 读取，一行一个 "step param value"）：
+    td_project/param_merge_equal_off_syn.tcl   给 syn_1
+    td_project/param_timingultra_phy.tcl       给 phy_1
+  ★ 绝不要手写 .al：格式无文档，写坏会导致 TD 打不开工程。
+
+【不依赖 GUI 的命令行复现法（本会话就是这么跑出结果的）】
+  1) 建目录 .../camera_to_dsi_display_Runs/<新名>/，拷入 phy_1 的 settings.cfg 与
+     camera_to_dsi_display.prj；settings.cfg 里 set parent 指向要用的 syn 目录
+  2) 流程脚本：拷 D:\anlogic TD\scripts\DefaultFlow.tcl，在 opt_rtl_fun / opt_gate_fun
+     的 commit_param 之后插 set_param rtl merge_equal off；在 prepare / opt_place_fun /
+     opt_route_fun 里插 TimingUltra 的 set_param。本会话脚本还在：
+        phy_tu3_cli/flow_tu3.tcl   syn_tu_cli/flow_syn_tu.tcl
+  3) ★ 必须用 stdin 执行，不能用参数形式（它是 Tcl 提示符，参数会被当命令、且
+     带空格的路径会被拆坏 → wrong # args: should be "source ..."）：
+        'source {<绝对路径，正斜杠>/flow_tu3.tcl}' |
+            "D:\anlogic TD\bin\td_commands_prompt.exe"
+     耗时：仅综合约 2 分钟；综合+布线+bitgen 约 13 分钟。
+     注意：必须在 TD 关闭时跑，且工作目录设为该 run 目录（脚本用相对路径）。
+
+【顺带修好的东西（本次会话）】
+  · sim/check_static.py 之前因硬编码的工程外路径
+    (04_MLK-CAM001-CS500\...\cfg_cs500.c) 失效而**直接崩溃**，导致 3b/4/5/6 节
+    根本跑不到。现改为"参照文件缺失时明确跳过 4 项、不计入通过"，并加固了输出
+    被重定向时的编码（原来结尾的 ✓ 在 GBK 码页下会抛异常，返回假失败）。
+    现状：通过 152 项 / 跳过 4 项；把 cfg_cs500.c 放回原路径或
+    doc/hw/official500/ 下即自动恢复成 156 项。
+  · I2C 回归其实是两步（先跑 tb_uicfgcs520 生成 sim/tb_run.log，再跑
+    check_i2c_seq.py），已写进 AGENTS.md；且编译必须显式列出
+    uics520reg_720p60.v（模块名 uics520reg_1080p60 与文件名不一致，-y 找不到）。
+  · 新增 sim/check_inline_fdiff.py：校验内联副本是否与源文件同步（规则 2 的
+    自动检查），并已写进 AGENTS.md 的"改完必做"。
+  · .gitignore 补 *.vvp；取消跟踪 _Runs/ 下 129 个编译产物（42.66 MB）。
+
+【本次新增的仓库文件】
+  sim/check_inline_fdiff.py
+  td_project/param_timingultra_phy.tcl
+  td_project/param_merge_equal_off_syn.tcl
+
+================================================================================
+（完）
+================================================================================

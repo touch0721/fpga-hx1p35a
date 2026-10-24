@@ -1,0 +1,36 @@
+# ---- TD å·¥ç¨‹ç¼–è¯‘äº§ç‰© / ä¸´æ—¶æ–‡ä»¶ï¼ˆä¸è¦è¿›ç‰ˆæœ¬åº“ï¼‰----
+td_project/*_Runs/
+td_project/**/*_Runs/
+td_project/log/
+td_project/*.log
+td_project/*.logw
+td_project/*.dmp
+td_project/.lock.f
+td_project/.recent_user_depot.ini
+td_project/chip_debugger/
+td_project/*.timingsummary
+td_project/**/*.timingsummary
+
+# ---- ä»¿çœŸäº§ç‰© ----
+*.vvp
+sim/*.log
+sim/_tmp/
+sim/tb_run.log
+*.vcd
+*.fst
+*.lxt
+*.lxt2
+
+# ---- ç³»ç»Ÿ / ç¼–è¾‘å™¨ ----
+Thumbs.db
+desktop.ini
+.DS_Store
+*~
+*.bak
+*.orig
+*.swp
+.vscode/
+dist/
+
+# ½»¸¶´ò°ü²úÎï
+½»¸¶_*.zip

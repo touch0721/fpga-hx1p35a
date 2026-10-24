@@ -1,0 +1,30 @@
+# 浜や粯鎵撳寘瑙勫垯锛歡it archive 鏃惰嚜鍔ㄦ帓闄ら潪婧愮爜鏂囦欢
+#   鐢ㄦ硶锛歡it archive --format=zip -o 浜や粯.zip HEAD
+#
+# ---- 缂栬瘧浜х墿 / 鏃ュ織 ----
+td_project/log/ export-ignore
+td_project/import/ export-ignore
+td_project/*Runs/ export-ignore
+td_project/*.log export-ignore
+td_project/*.logw export-ignore
+td_project/*.timingsummary export-ignore
+td_project/.lock.f export-ignore
+*.log export-ignore
+*.logw export-ignore
+*.vvp export-ignore
+*.vcd export-ignore
+*.fsdb export-ignore
+*.bit export-ignore
+
+# ---- 鍘嗗彶褰掓。锛坆it 涓庢姤鍛婏紝浣撶Н澶э紝浜や粯涓嶉渶瑕侊級----
+artifacts/ export-ignore
+
+# ---- 宸ュ叿缂撳瓨 ----
+.iccoder/ export-ignore
+dist/ export-ignore
+sim/_tmp/ export-ignore
+__pycache__/ export-ignore
+*.pyc export-ignore
+
+# ---- 参考归档里的大压缩包（40MB，交付不需要）----
+doc/hw/*.zip export-ignore

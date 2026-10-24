@@ -1,0 +1,186 @@
+﻿================================================================================
+ SC500CS 摄像头配置 + 黑电平校正 + Gamma   移植包
+ 下一个工作区操作指示
+================================================================================
+来源工程：lab_ex1_mipi_hdmi（安路 TD / PH1P35MDG324 / HX1P35A 开发板）
+适用器件：SmartSens SC500CS（I2C 从机地址 0x6C，SID 引脚为低）
+本指示配套文件：sc500cs_cam_pack.v / tb_sc500cs_pack.v / make_pack.py
+
+--------------------------------------------------------------------------------
+一、本包含什么
+--------------------------------------------------------------------------------
+  sc500cs_cam_pack.v    单文件移植包，内含 7 个模块（约 890 行）——
+                          1. sc500cs_i2c_master   I2C 主机控制器（开漏、支持随机读）
+                          2. sc500cs_reg_init     初始化寄存器表 117 条（1280x720@60）
+                          3. sc500cs_reg_ae       曝光/增益表 7 条
+                          4. sc500cs_gain_tbl     增益档位 -> {0x3e08,0x3e09}
+                          5. sc500cs_cfg          I2C 定序器（无按键版）
+                          6. sc500cs_blc_raw40    黑电平校正（RAW10 域）
+                          7. sc500cs_gamma_rgb96  Gamma 校正（RGB888 域）
+  tb_sc500cs_pack.v     自检 testbench，完全自包含（内含 I2C 从机模型），
+                        只依赖 sc500cs_cam_pack.v，不需要旧工程任何文件
+  make_pack.py          可选。旧工程还在时，改完寄存器表可用它重新生成 pack
+
+  实际只需要 sc500cs_cam_pack.v 一个文件就能工作；另两个是可选的。
+
+--------------------------------------------------------------------------------
+二、复制操作
+--------------------------------------------------------------------------------
+  把整个 handover 文件夹拷到新工作区，例如：
+      <新工程>/user_source/hdl_source/handover/
+
+--------------------------------------------------------------------------------
+三、新工程要做的 7 步
+--------------------------------------------------------------------------------
+【第 1 步】把 pack 加入工程源文件列表
+   安路 TD：打开工程 -> 设计树右键 -> Add Source -> 选 sc500cs_cam_pack.v
+   ★ 不要从外部用文本编辑器改 td_project/*.al —— TD 开着工程时保存会用内存里
+     的旧文件列表覆盖磁盘，改动会丢失（本项目实际踩过两次）。
+
+【第 2 步】准备摄像头时钟与上电时序（本包不含，需新工程自己做）
+   - 给摄像头 24 MHz MCLK
+   - PWDNB/XSHUTDN 先拉低 >=1 ms，释放后再等 >=5 ms 才开始 I2C
+     参考：设计里用 24 MHz 域计数器实现，示意——
+        计数 >= 23809  (1 ms)  -> PWDNB 拉高
+        计数 >= 119048 (5 ms)  -> 释放 I2C 复位
+   - I2C 复位直接接上一步的 "可开始 I2C" 信号
+
+【第 3 步】例化 I2C 配置（24 MHz 域，无按键）
+
+    localparam integer CLK_24M_HZ = 23809524;   // 改成你实际的 I_clk 频率
+
+    sc500cs_cfg #(
+        .CLK_DIV   ( CLK_24M_HZ/100000 - 1 ),   // SCL 约 100 kHz
+        .CLK_HZ    ( CLK_24M_HZ            ),   // 5ms/10ms 延时靠它换算
+        .AE_DEFAULT( 16'd1990              ),   // 曝光，1/2 行为单位
+        .AG_DEFAULT( 16'd144               ),   // 增益档位 -> 15.750x
+        .AE_ONLINE ( 1'b0                  )    // 0 = 不用按键/外部 AE
+    ) u_cam_cfg (
+        .I_clk        ( clk_24m      ),
+        .I_rst_n      ( cam_i2c_rdy  ),         // 上电延时完成信号
+        .I_ae_req     ( 1'b0         ),         // AE_ONLINE=0 时这三个脚被忽略
+        .I_ae         ( 16'd0        ),
+        .I_ag         ( 16'd0        ),
+        .O_cam_scl    ( O_cam_scl    ),
+        .IO_cam_sda   ( IO_cam_sda   ),
+        .O_cfg_done   ( cam_cfg_done ),         // 配置完成
+        .O_ae_cfg_done(              ),
+        .O_sensor_id  ( cam_sensor_id),         // 调试可挂 ChipWatcher
+        .O_sensor_id_ok(cam_id_ok    ),
+        .O_iic_error  ( cam_i2c_err  )          // 挂调试用，正常应为 0
+    );
+
+   说明：AE_ONLINE=0 时，配置完成后会自动用 AE_DEFAULT/AG_DEFAULT 写一次 AE 表
+         （等价于旧工程里 ae_set 上电后的那一次写入），不需要任何按键。
+
+【第 4 步】例化黑电平校正（CSI 接收时钟域，放在 demosaic 之前）
+
+    sc500cs_blc_raw40 #(
+        .Black_level_offset_r0 (10'd15),
+        .Black_level_offset_r1 (10'd15),
+        .Black_level_offset_r2 (10'd15),
+        .Black_level_offset_r3 (10'd15)
+    ) u_blc (
+        .I_clk(csi_clk), .I_rst_n(rst_n),
+        .I_tlast(raw_tlast), .I_tuser(raw_tuser),
+        .I_tdata(raw_tdata),                 // 40 bit = 4 像素 x RAW10
+        .I_tvalid(raw_tvalid),
+        .O_tlast(blc_tlast), .O_tuser(blc_tuser),
+        .O_tdata(blc_tdata), .O_tvalid(blc_tvalid)
+    );
+    // demosaic 的 tdata/tlast/tuser/tvalid 改接 blc_*，tready 直连上游 ready
+
+【第 5 步】例化 Gamma（CSI 接收时钟域，放在 AWB 之后、96->128bit 打包之前）
+
+    sc500cs_gamma_rgb96 u_gamma (
+        .I_clk(csi_clk), .I_rst_n(rst_n),
+        .I_tlast(awb_tlast), .I_tuser(awb_tuser),
+        .I_tdata(awb_tdata),                 // 96 bit = 4 像素 x RGB888
+        .I_tvalid(awb_tvalid),
+        .O_tlast(gam_tlast), .O_tuser(gam_tuser),
+        .O_tdata(gam_tdata), .O_tvalid(gam_tvalid)
+    );
+
+   位置顺序必须是：demosaic -> (128->96) -> AWB -> Gamma -> (96->128) -> DDR
+   - Gamma 放在 AWB 之后：AWB 用 R/G/B 帧均值算增益，Gamma 放它前面会被反向补偿
+   - 三级之间都无背压（ready 是直通），所以这两个模块没有 tready 也不会丢数
+
+【第 6 步】引脚约束（.adc 文件）
+   至少要有这几根：
+       O_cam_scl / IO_cam_sda / O_cam_24m / O_cam_rst
+   ★ .adc 的注释符是 #，不是 //（写成 // 会被 TD 静默丢弃）
+   ★ I2C 两根线上必须给 PULLTYPE = PULLUP
+
+【第 7 步】时钟约束（.sdc 文件）
+   MIPI 接收时钟 = Lane速率 / 2（DDR）。本包是 480 Mbps/Lane：
+       create_clock -name {mipi_rx_ck_pad} -period 4.167 -waveform {0.000 2.083} \
+                    [get_nets {IO_rx_clk_pad_p}]
+   换速率时：period(ns) = 2 / Lane速率(Gbps)
+
+--------------------------------------------------------------------------------
+四、必须核对的参数
+--------------------------------------------------------------------------------
+  I_clk 频率      sc500cs_cfg.CLK_HZ     不是 23.809524 MHz 就必须改
+  I2C 从机地址    sc500cs_cfg 内 CAM_ID  = 8'h6C（SID 低）。SID 拉高时 7'h10 -> 0x20
+  Sensor ID 校验  sc500cs_cfg 内 0xEE27  SC500CS 手册表 1-6；换料号要同步改
+  分辨率/帧率     sc500cs_reg_init 内：
+                    0x3208/0x3209 = 0x05/0x00 -> 宽 1280
+                    0x320a/0x320b = 0x02/0xd0 -> 高 720
+                    0x320e/0x320f = 0x03/0xe8 -> VTS 1000 -> 60 fps
+  速率关系        PCLK = HTS x VTS x fps；Lane速率 = PCLK x 10bit / 2lane
+                  当前 HTS 0x320c/0x320d = 0x06/0x40 = 1600 -> 96 MHz -> 480 Mbps
+  BLC 偏置        sc500cs_blc_raw40 的 10'd15（10bit 域）。暗部发灰就加大，
+                  暗部死黑就减小
+  Gamma 曲线      sc500cs_gamma_rgb96 内 BASE[16] / DELTA[16] 表
+                  实测：0x00->0x00、0x40->0x61、0x80->0x9d、0xc0->0xd1、0xff->0xff
+
+  ★ 改分辨率/帧率时，除了本包里的寄存器，新工程里这些也要跟着改：
+      demosaic 的 IMG_WIDTH / IMG_HEIGHT / BAYER_MODE
+      AWB 的 IMG_WIDTH / IMG_HEIGHT
+      HDMI 输出时序（VTC 的 H_ActiveSize / V_ActiveSize）
+      行缓存 / FIFO 行宽 / DDR 帧缓存
+      行数、行长等调试判据
+
+--------------------------------------------------------------------------------
+五、验证（不用旧工程，直接在新工程里跑）
+--------------------------------------------------------------------------------
+  在 handover 目录下执行：
+      iverilog -g2012 -o tb.vvp tb_sc500cs_pack.v sc500cs_cam_pack.v
+      vvp tb.vvp
+  看到 "*** ALL CHECKS PASSED ***" 即说明下面这些都对：
+      A  读 ID = 0xEE27 成功
+      A  初始化表 117 条按 0..116 顺序写出
+      A  索引 0 = 0x0103=0x01、索引 115 = 0x0100=0x01、索引 116 = 0x302d=0x00
+      A  软复位后等 5 ms、stream on 后等 10 ms
+      A  自动写一次 AE 表：曝光 1990、0x3e08=0x1f、0x3e09=0x3f、数字增益 1.000x
+      A  1280x720、VTS 1000、I2C 无 NACK
+      B  黑电平：512->497、4->0（钳位）、255->240、1023->1008
+      C  Gamma：0x00->0x00、0x40->0x61、0x80->0x9d、0xc0->0xd1、0xff->0xff
+
+  上板后看调试状态码：若沿用旧工程的 hdmi_mixer DEBUG_MODE=4 方案——
+      7=I2C 出错  0=配置未完成  1=无 HS 流量  2=无完整 CSI 帧
+      3=lane 错   4=行字节数错  5=帧行数错   6=正常
+  正常应停在 6。
+
+--------------------------------------------------------------------------------
+六、已知坑
+--------------------------------------------------------------------------------
+  1. 不要从外部编辑 .al：TD 开着工程会被覆盖。加源文件走 GUI 的 Add Source。
+  2. .adc 注释用 #，Verilog 注释用 //，Python 用 #。用错会被静默丢弃或报语法错。
+  3. 摄像头按键若接了板载按键，空闲必须为高（PULLUP）。做成下拉或浮空为低时，
+     旧工程的 AE 控制器会误判为"一直按住"，把模拟增益一路降到 1.000x，画面变暗。
+     —— 本 pack 是无按键版，不含这个问题。
+  4. 若传感器没出图：先确认 I2C 是否被 ACK（O_iic_error），再看 O_sensor_id
+     实际读回值。ID 不匹配时定序器会进错误态，一条寄存器都不会写。
+  5. MIPI 出现花屏/闪点时，调 PHY 的接收均衡与相位（HS_EQUALIZER / HS_VGA_GAIN、
+     I_data_lane*_in_delay），以及传感器侧 0x3652 / 0x3654（40 ps/step）。
+
+--------------------------------------------------------------------------------
+七、注意事项
+--------------------------------------------------------------------------------
+  - 本包的初始化表就是 SC500CS 原厂 1280x720@60 全表（116 条）+ 1 条 AGC 使能
+    （0x3e03 = 0x0b，手册 2.2.3 节要求，原厂表未写）。除这一条外与原厂表逐条一致。
+  - I2C SCL 频率由 CLK_DIV 决定：SCL = CLK_HZ / (2 x (CLK_DIV+1))。
+    100 kHz 对应 CLK_DIV = CLK_HZ/100000 - 1。
+  - 5 ms / 10 ms 延时由 CLK_HZ 换算（CLK_HZ/200 与 CLK_HZ/100），换主频只改 CLK_HZ。
+================================================================================

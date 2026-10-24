@@ -1,0 +1,14 @@
+place effort high
+place opt_timing ultra
+place logic_level_opt on
+place aggressive_opt 21
+place enable_extra_timing on
+place opt_long_path_over_slack 600
+place shifter_opt on
+place shifter_opt_preplace on
+place crit_path_opt on
+place post_place_opt high
+place hfn_opt_effort high
+route post_route_opt high
+route postrt_opt_loc 20
+route postrt_opt_extra_round 4
